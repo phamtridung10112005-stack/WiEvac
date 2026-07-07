@@ -88,6 +88,12 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_start());
 #endif
 
+    // =========================================================================
+    // [BỔ SUNG CHÍ MẠNG] Ép cứng công suất phát mức MAX (78 tương đương 19.5 dBm)
+    // Ngăn chặn ESP32 tự động tăng/giảm sóng làm biến dạng baseline A0_max
+    // =========================================================================
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(78));
+
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
 #if CONFIG_IDF_TARGET_ESP32C5
