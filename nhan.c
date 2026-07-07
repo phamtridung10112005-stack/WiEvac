@@ -7,10 +7,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>         // Thêm thư viện toán học để tính toán DSP
-#include "esp_timer.h"    // Lấy mốc thời gian chạy hệ thống để làm mỏ neo AI
-#include "lwip/sockets.h" // Thêm thư viện mạng để chạy UDP Sockets
-#include "esp_event.h"    // Quản lý sự kiện kết nối mạng
+#include <math.h>         // DSP math
+#include "esp_timer.h"    // Timestamp
+#include "lwip/sockets.h" // UDP Sockets
+#include "esp_event.h"    // Wi-Fi events
 
 #include "nvs_flash.h"
 #include "esp_mac.h"
@@ -21,20 +21,32 @@
 #include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
 
-// ĐỒNG BỘ KÊNH 11 THEO ĐÚNG KÊNH PHÁT THỰC TẾ CỦA PI 5 VÀ C6
+// --- [THÊM MỚI] THƯ VIỆN & CẤU HÌNH ---
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define FAIL_SAFE_PIN 4             // Chân GPIO còi hú/đèn LED
+#define STD_DEV_THRESHOLD 1.5       // Ngưỡng tĩnh báo động khi mất Pi 5
+
+uint8_t g_auto_node_id = 0;         
+bool g_is_standalone_mode = true;   // Khởi động mặc định là chế độ sinh tồn (chưa có mạng)
+// ---------------------------------------------------
+
+// ĐỒNG BỘ KÊNH 11
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
-#define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20  // ĐỒNG BỘ: Hạ về băng thông 20MHz
-#define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20  // ĐỒNG BỘ: Hạ về băng thông 20MHz
+#define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20  
+#define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20  
 #define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
 #define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
 #else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT20      // ĐỒNG BỘ: Hạ băng thông lõi S3 về 20MHz
+#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT20      
 #endif
 
-#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20   // ĐỒNG BỘ: Chuyển PHY Mode ESP-NOW về HT20
+#define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20   
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
 
@@ -50,26 +62,26 @@
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
-// CẤU HÌNH ĐƯỜNG TRUYỀN UDP HƯỚNG VỀ BỘ NÃO PI 5
-#define PI_GATEWAY_IP   "10.42.0.1"    // IP mạng Hotspot Pi 5
-#define PI_UDP_PORT     8888           // Cổng mạng hứng dữ liệu trên Pi 5
-#define PI_WIFI_SSID    "WiEvac_Pi5"   // Tên Wi-Fi của Pi 5
-#define PI_WIFI_PASS    "12345678"     // Mật khẩu Wi-Fi của Pi 5
+// CẤU HÌNH PI 5
+#define PI_GATEWAY_IP   "10.42.0.1"    
+#define PI_UDP_PORT     8888           
+#define PI_WIFI_SSID    "WiEvac_Pi5"   
+#define PI_WIFI_PASS    "12345678"     
 
-// static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const char *TAG = "csi_recv";
 
 static int g_udp_socket = -1;
 static struct sockaddr_in g_pi_addr;
 
-// ĐỊNH NGHĨA STRUCT ĐẶC TRƯNG CHUẨN 13 BYTES
+// STRUCT 13 BYTES
 typedef struct __attribute__((packed)) {
-    uint8_t node_id;       // 1 Byte
-    float std_dev;         // 4 Bytes
-    float mean_amp;        // 4 Bytes
-    uint32_t timestamp;    // 4 Bytes
+    uint8_t node_id;       
+    float std_dev;         
+    float mean_amp;        
+    uint32_t timestamp;    
 } csi_feature_packet_t;
 
+// Hàm hỗ trợ Quick Sort cho bộ lọc Hampel
 static void quick_sort(float arr[], int left, int right) {
     int i = left, j = right;
     float tmp;
@@ -86,19 +98,42 @@ static void quick_sort(float arr[], int left, int right) {
     if (i < right) quick_sort(arr, i, right);
 }
 
-// Bộ quản lý sự kiện mạng: Chỉ kích hoạt bộ lọc sóng khi kết nối mạng hoàn tất ổn định
+// ==============================================================================
+// BỘ QUẢN LÝ SỰ KIỆN WI-FI (ĐÃ TỐI ƯU CƠ CHẾ AUTO-RECOVERY LÌ LỢM)
+// ==============================================================================
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        ESP_LOGI(TAG, "🎉 BẮT TAY PI 5 THÀNH CÔNG! Kích hoạt chế độ đón sóng CSI...");
-        esp_wifi_set_promiscuous(true); // Kích hoạt Sniffer tầng vật lý công khai
-        esp_wifi_set_csi(true);        // Mở van trích xuất ma trận CSI
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        // Bắt đầu vòng đời kết nối
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "🎉 KẾT NỐI WI-FI THÀNH CÔNG! Đang chờ DHCP...");
     } 
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Đã nhận IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // CÓ MẠNG: Tắt sinh tồn, tắt còi
+        g_is_standalone_mode = false;
+        gpio_set_level(FAIL_SAFE_PIN, 0);
+
+        // Bật đón sóng CSI
+        esp_wifi_set_promiscuous(true); 
+        esp_wifi_set_csi(true);
+        ESP_LOGI(TAG, "Kích hoạt CSI. Đang bắn data lên Pi 5!");
+    }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Bị ngắt kết nối! Đang tạm tắt bộ lọc để bám lại mạng Pi 5...");
+        // Tắt đón sóng CSI để dồn tài nguyên reconnect
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_csi(false);
+        
+        // MẤT MẠNG: Bật sinh tồn, chuẩn bị hú còi nếu có biến
+        g_is_standalone_mode = true;
+        ESP_LOGW(TAG, "⚠️ MẤT PI 5! Kích hoạt sinh tồn. Đang thử kết nối lại...");
+        
+        // Ép mạch liên tục gọi cửa kết nối lại (Bỏ luôn giới hạn đếm số lần)
         esp_wifi_connect();
     }
 }
@@ -106,14 +141,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 static void udp_client_init(void) {
     g_udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (g_udp_socket < 0) {
-        ESP_LOGE(TAG, "Lỗi tạo Socket UDP!");
+        ESP_LOGE(TAG, "Lỗi tạo UDP Socket!");
         return;
     }
     memset(&g_pi_addr, 0, sizeof(g_pi_addr));
     g_pi_addr.sin_addr.s_addr = inet_addr(PI_GATEWAY_IP);
     g_pi_addr.sin_family = AF_INET;
     g_pi_addr.sin_port = htons(PI_UDP_PORT);
-    ESP_LOGI(TAG, "Mở Socket hướng về bộ não Pi 5 [%s:%d] thành công!", PI_GATEWAY_IP, PI_UDP_PORT);
 }
 
 static void wifi_init()
@@ -121,17 +155,13 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
     
-    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-
+    esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Đăng ký Event để theo dõi cái bắt tay của Pi 5
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    // Đăng ký Event Loop
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -140,7 +170,7 @@ static void wifi_init()
         .sta = {
             .ssid = PI_WIFI_SSID,
             .password = PI_WIFI_PASS,
-            .channel = 0, // Để bằng 0 để chip tự do quét và đồng bộ cấu hình Kênh/Băng thông của Pi 5
+            .channel = 0, 
             .pmf_cfg = {
                 .capable = true,          
                 .required = false
@@ -148,24 +178,14 @@ static void wifi_init()
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // CẤU HÌNH BĂNG THÔNG SAU KHI START ĐỂ TRÁNH LỖI CRASH
+    // CẤM NGỦ ĐỂ BẮT ĐỦ GÓI ESP-NOW
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
 #if !CONFIG_IDF_TARGET_ESP32C5 && !(CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) && !CONFIG_IDF_TARGET_ESP32C61
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, CONFIG_WIFI_BANDWIDTH));
 #endif
-
-    // Cấu hình IP Tĩnh 10.42.0.2 chạy ngầm ngay sau khi start
-    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif)); 
-    esp_netif_ip_info_t ip_info;
-    IP4_ADDR(&ip_info.ip, 10, 42, 0, 2);       
-    IP4_ADDR(&ip_info.gw, 10, 42, 0, 1);       
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
-
-    ESP_LOGI(TAG, "Đường truyền IP Tĩnh đã sẵn sàng. Đang tiến hành kết nối...");
-    esp_wifi_connect();
 }
 
 static void wifi_esp_now_init(esp_now_peer_info_t peer)
@@ -173,15 +193,14 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer)
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-    ESP_LOGI(TAG, "Khởi tạo mạng ESP-NOW lắng nghe kênh CSI sạch sẽ.");
 }
 
+// ==============================================================================
+// XỬ LÝ TÍN HIỆU SỐ (DSP) & ĐÓNG GÓI
+// ==============================================================================
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf) return;
-
-    // VÔ HIỆU HÓA BỘ LỌC MAC: Chấp nhận tất cả gói tin thu được trên Kênh 11 để chống lệch danh tính MAC Broadcast
-    // if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) return;
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     static int s_count = 0;
@@ -204,12 +223,13 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
 #endif
 
+    // Rút trích Biên độ
     int num_subcarriers = info->len / 2; 
     float amp_sum = 0;
     int valid_subcarriers_count = 0;
 
-    // Vòng lặp DSP duyệt qua dải Subcarriers của băng thông 20MHz (Khoảng 52-56 sóng con hợp lệ)
     for (int i = 0; i < num_subcarriers; i++) {
+        // Lọc bỏ kênh hoa tiêu rác
         if (i < 6 || i > (num_subcarriers - 6) || (i > (num_subcarriers / 2 - 3) && i < (num_subcarriers / 2 + 3))) {
             continue;
         }
@@ -223,6 +243,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     if (valid_subcarriers_count == 0) return;
     float current_packet_amp = amp_sum / valid_subcarriers_count;
 
+    // Lọc Hampel gạt Outlier
     static float hampel_window[5] = {0};
     static int hampel_idx = 0;
     hampel_window[hampel_idx] = current_packet_amp;
@@ -242,11 +263,13 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         current_packet_amp = median;
     }
 
+    // Lọc Trung bình trượt hàm mũ (EMA) làm mượt sóng
     static float ema_amp = -1.0f;
     const float alpha = 0.08f;
     if (ema_amp < 0) ema_amp = current_packet_amp;
     else ema_amp = (alpha * current_packet_amp) + ((1.0f - alpha) * ema_amp);
 
+    // Gom mẫu tính Tần suất & Rung lắc (100 packets/block)
     static float feature_window[100] = {0};
     static int feature_count = 0;
     feature_window[feature_count++] = ema_amp;
@@ -260,21 +283,29 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         for (int i = 0; i < 100; i++) variance_sum += (feature_window[i] - mean) * (feature_window[i] - mean);
         float std_dev = sqrtf(variance_sum / 100.0f); 
 
-        // ĐÓNG GÓI VECTOR ĐẶC TRƯNG TINH KHIẾT 13 BYTES
         csi_feature_packet_t packet;
-        packet.node_id = 1; 
+        packet.node_id = g_auto_node_id;  
         packet.std_dev = std_dev;
         packet.mean_amp = mean;
         packet.timestamp = (uint32_t)(esp_timer_get_time() / 1000); 
 
-        printf("[COMPRESSED] Size: %d Bytes | Node: %d | STD: %.4f | Mean: %.4f | TS: %lu\n", 
-               (int)sizeof(packet), packet.node_id, packet.std_dev, packet.mean_amp, (unsigned long)packet.timestamp);
-
-        // NÃ UDP THẲNG LÊN IP CARD MẠNG HOTSPOT CỦA PI 5
-        if (g_udp_socket >= 0) {
-            sendto(g_udp_socket, &packet, sizeof(packet), 0, (struct sockaddr *)&g_pi_addr, sizeof(g_pi_addr));
+        // LOGIC ĐIỀU PHỐI ĐẦU RA 
+        if (g_is_standalone_mode) {
+            // Mất Pi 5 -> Dùng luật If/Else nội bộ để hú còi 
+            // Nếu độ ồn vượt 2 lần ngưỡng tĩnh -> Có nguy hiểm
+            if (std_dev > (STD_DEV_THRESHOLD * 2.0)) {
+                gpio_set_level(FAIL_SAFE_PIN, 1);
+            } else {
+                gpio_set_level(FAIL_SAFE_PIN, 0);
+            }
+        } else {
+            // Có Pi 5 -> Chăm chỉ nhả data 1 lần/giây
+            if (g_udp_socket >= 0) {
+                sendto(g_udp_socket, &packet, sizeof(packet), 0, (struct sockaddr *)&g_pi_addr, sizeof(g_pi_addr));
+            }
         }
-        feature_count = 0; 
+        
+        feature_count = 0;
     }
     s_count++;
 }
@@ -287,7 +318,7 @@ static void wifi_csi_init()
         .acquire_csi_legacy       = false,
         .acquire_csi_force_lltf   = CSI_FORCE_LLTF,
         .acquire_csi_ht20         = true,
-        .acquire_csi_ht40         = false, // ĐỒNG BỘ: Tắt trích xuất HT40
+        .acquire_csi_ht40         = false, 
         .acquire_csi_vht          = false,
         .acquire_csi_su           = false,
         .acquire_csi_mu           = false,
@@ -303,7 +334,7 @@ static void wifi_csi_init()
         .enable                 = true,
         .acquire_csi_legacy     = false,
         .acquire_csi_ht20       = true,
-        .acquire_csi_ht40       = false, // ĐỒNG BỘ: Tắt trích xuất HT40
+        .acquire_csi_ht40       = false, 
         .acquire_csi_su         = true,
         .acquire_csi_mu         = true,
         .acquire_csi_dcm        = true,
@@ -336,6 +367,19 @@ void app_main()
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    
+    // Cấu hình chân còi hú/đèn LED (FAIL_SAFE_PIN)
+    gpio_reset_pin(FAIL_SAFE_PIN);
+    gpio_set_direction(FAIL_SAFE_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(FAIL_SAFE_PIN, 0);
+
+    uint8_t mac_addr[6];
+    esp_read_mac(mac_addr, ESP_MAC_WIFI_STA);
+    g_auto_node_id = mac_addr[5]; 
+    
+    ESP_LOGI("MAIN", "==================================");
+    ESP_LOGI("MAIN", "🚀 WIEVAC EDGE NODE (ID: %d) READY!", g_auto_node_id);
+    ESP_LOGI("MAIN", "==================================");
 
     wifi_init();
 
